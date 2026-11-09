@@ -15,6 +15,10 @@ graphics (16 GB RAM), running MiniCPM5-1B Q4_K_M.
 Result: up to **1.9× faster than stock llama.cpp on the CPU** at 4000 tokens of context, and 7–26% faster
 than llama.cpp on the GPU (tables below).
 
+## Download
+
+A ready-built Windows x64 zip (no compiler needed) is on the [Releases page](https://github.com/krish-patel-01/duet/releases/latest). Unzip it and run `hybrid.exe -m model.gguf --chat -i`. You need the [VC++ 2015–2022 x64 runtime](https://aka.ms/vs/17/release/vc_redist.x64.exe) and a Vulkan GPU driver.
+
 ## What's in here
 
 | Path | What it is |
