@@ -1,0 +1,3 @@
+# keep patches byte-exact so git apply works
+*.patch -text
+*.bat text eol=crlf

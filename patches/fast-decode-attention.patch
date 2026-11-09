@@ -1,0 +1,269 @@
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 266261c5e..88aa9de18 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9209,10 +9209,264 @@ static void ggml_flash_attn_ext_reduce_partials(
+     }
+ }
+ 
++// ---------------------------------------------------------------------------------------------
++// Fast decode attention (hybrid project).
++//
++// For one query token with F16 K/V, the generic path above handles one query head at a time: the
++// heads that share a KV head (grouped-query attention) each re-read the same keys and values,
++// it walks the keys one at a time with a scalar expf, and it accumulates V in F16. At long context
++// that makes decode compute-bound far below what RAM allows.
++//
++// This kernel takes all G query heads of a KV group together. Per block of 64 keys it computes the
++// G x 64 scores with each K row loaded once, does a vectorised online-softmax update, then adds
++// P x V with each V row loaded once and the G accumulators held in FP32 registers. Keys are split
++// across threads; the per-thread partials are merged with ggml_flash_attn_ext_reduce_partials.
++// Set GGML_FA_DECODE=0 to fall back to the stock path (for A/B checks).
++// ---------------------------------------------------------------------------------------------
++#if defined(__AVX2__) && defined(__F16C__) && defined(__FMA__)
++
++static inline float fa_dec_hsum(__m256 v) {
++    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
++    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
++    s = _mm_add_ss(s, _mm_movehdup_ps(s));
++    return _mm_cvtss_f32(s);
++}
++
++// out[i] = horizontal sum of v[i], for 8 vectors at once
++static inline __m256 fa_dec_hsum8x8(const __m256 * v) {
++    const __m256 t0 = _mm256_hadd_ps(_mm256_hadd_ps(v[0], v[1]), _mm256_hadd_ps(v[2], v[3]));
++    const __m256 t1 = _mm256_hadd_ps(_mm256_hadd_ps(v[4], v[5]), _mm256_hadd_ps(v[6], v[7]));
++    return _mm256_add_ps(_mm256_permute2f128_ps(t0, t1, 0x20), _mm256_permute2f128_ps(t0, t1, 0x31));
++}
++
++static constexpr int FA_DEC_BLOCK = 64;
++static constexpr int FA_DEC_DMAX  = 256;
++static constexpr int FA_DEC_PF    = 8;   // prefetch K this many rows ahead
++
++// Folds keys [k0, k1) of one KV head into the running state of its G query heads.
++// qs: the G scaled query rows, [G][DK], 32-byte aligned.
++// st[h]: that head's state, laid out like a partial: [M, S, acc[DV]] (acc not yet divided by S).
++// Because the state carries over, a thread can process any set of key blocks in any order.
++template <int G>
++static void fa_dec_group(
++        const float * qs,
++        const char * kb, size_t nbk1,
++        const char * vb, size_t nbv1,
++        const ggml_fp16_t * mrow,
++        int64_t k0, int64_t k1, int DK, int DV,
++        float * const * st) {
++
++    alignas(32) float sc[G][FA_DEC_BLOCK];
++    int live[FA_DEC_BLOCK];
++
++    for (int64_t b0 = k0; b0 < k1; b0 += FA_DEC_BLOCK) {
++        const int n = (int) std::min<int64_t>(FA_DEC_BLOCK, k1 - b0);
++
++        // keys the mask leaves visible; masked ones get a score of -inf
++        int nl = 0;
++        for (int i = 0; i < n; ++i) {
++            const float mv = mrow ? GGML_CPU_FP16_TO_FP32(mrow[b0 + i]) : 0.0f;
++            if (mv == -INFINITY) {
++                for (int h = 0; h < G; ++h) sc[h][i] = -INFINITY;
++            } else {
++                live[nl++] = i;
++                sc[0][i] = mv; // stash the mask value until the score is computed
++            }
++        }
++        if (nl == 0) continue;
++
++        // scores: one pass over each K row for all G heads
++        for (int j = 0; j < nl; ++j) {
++            const int i = live[j];
++            const float mv = sc[0][i];
++            const ggml_fp16_t * kr = (const ggml_fp16_t *) (kb + (b0 + i)*nbk1);
++            // pull in this key's V row (needed right after the scores) and a K row further ahead,
++            // so the RAM fetches overlap with the arithmetic
++            {
++                const char * vr = vb + (b0 + i)*nbv1;
++                const char * kn = (const char *) kr + FA_DEC_PF*nbk1;
++                for (int64_t o = 0; o < DV*(int64_t) sizeof(ggml_fp16_t); o += 64) _mm_prefetch(vr + o, _MM_HINT_T0);
++                if (b0 + i + FA_DEC_PF < k1) {
++                    for (int64_t o = 0; o < DK*(int64_t) sizeof(ggml_fp16_t); o += 64) _mm_prefetch(kn + o, _MM_HINT_T0);
++                }
++            }
++            __m256 a[G];
++            for (int h = 0; h < G; ++h) a[h] = _mm256_setzero_ps();
++            for (int d = 0; d < DK; d += 8) {
++                const __m256 kv = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) (kr + d)));
++                for (int h = 0; h < G; ++h) a[h] = _mm256_fmadd_ps(kv, _mm256_load_ps(qs + h*DK + d), a[h]);
++            }
++            if constexpr (G == 8) {
++                alignas(32) float t[8];
++                _mm256_store_ps(t, fa_dec_hsum8x8(a));
++                for (int h = 0; h < G; ++h) sc[h][i] = t[h] + mv;
++            } else {
++                for (int h = 0; h < G; ++h) sc[h][i] = fa_dec_hsum(a[h]) + mv;
++            }
++        }
++
++        // online softmax: fold this block into M, S and rescale acc
++        for (int h = 0; h < G; ++h) {
++            float & Mh = st[h][0];
++            float & Sh = st[h][1];
++            float mb = -INFINITY;
++            for (int i = 0; i < n; ++i) mb = std::max(mb, sc[h][i]);
++            const float Mn   = std::max(Mh, mb);
++            const float corr = expf(Mh - Mn); // 0 on the first block (M = -inf)
++
++            const __m256 vm  = _mm256_set1_ps(Mn);
++            const __m256 vlo = _mm256_set1_ps(-104.0f); // ggml_v_expf flushes to 0 below this
++            __m256 vs = _mm256_setzero_ps();
++            int i = 0;
++            for (; i + 8 <= n; i += 8) {
++                const __m256 x = _mm256_max_ps(_mm256_sub_ps(_mm256_load_ps(&sc[h][i]), vm), vlo);
++                const __m256 p = ggml_v_expf(x);
++                _mm256_store_ps(&sc[h][i], p);
++                vs = _mm256_add_ps(vs, p);
++            }
++            float bs = fa_dec_hsum(vs);
++            for (; i < n; ++i) {
++                const float p = sc[h][i] == -INFINITY ? 0.0f : expf(sc[h][i] - Mn);
++                sc[h][i] = p;
++                bs += p;
++            }
++
++            Sh = Sh*corr + bs;
++            if (corr != 1.0f) {
++                const __m256 vc = _mm256_set1_ps(corr);
++                float * ah = st[h] + 2;
++                for (int d = 0; d < DV; d += 8) _mm256_storeu_ps(ah + d, _mm256_mul_ps(_mm256_loadu_ps(ah + d), vc));
++            }
++            Mh = Mn;
++        }
++
++        // acc += P x V: each V slice is loaded once and used by all G heads
++        for (int d = 0; d < DV; d += 8) {
++            __m256 r[G];
++            for (int h = 0; h < G; ++h) r[h] = _mm256_loadu_ps(st[h] + 2 + d);
++            for (int j = 0; j < nl; ++j) {
++                const int i = live[j];
++                const __m256 vv = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) ((const ggml_fp16_t *) (vb + (b0 + i)*nbv1) + d)));
++                for (int h = 0; h < G; ++h) r[h] = _mm256_fmadd_ps(_mm256_broadcast_ss(&sc[h][i]), vv, r[h]);
++            }
++            for (int h = 0; h < G; ++h) _mm256_storeu_ps(st[h] + 2 + d, r[h]);
++        }
++    }
++}
++
++static bool fa_dec_enabled() {
++    static const int on = [] {
++        const char * e = getenv("GGML_FA_DECODE");
++        return (e && e[0] == '0') ? 0 : 1;
++    }();
++    return on != 0;
++}
++
++// Returns false (and does nothing) when the shapes are not ones this kernel handles.
++static bool ggml_compute_forward_flash_attn_ext_decode_fast(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * q     = dst->src[0];
++    const ggml_tensor * k     = dst->src[1];
++    const ggml_tensor * v     = dst->src[2];
++    const ggml_tensor * mask  = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
++
++    if (params->use_ref || !fa_dec_enabled()) return false;
++    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) return false;
++    if (q->ne[1] != 1 || q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1) return false;
++    if (sinks) return false;
++    if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1)) return false;
++
++    const int64_t DK = k->ne[0], DV = v->ne[0];
++    if (DK % 8 || DV % 8 || DK > FA_DEC_DMAX || DV > FA_DEC_DMAX) return false;
++    if (k->nb[0] != sizeof(ggml_fp16_t) || v->nb[0] != sizeof(ggml_fp16_t) || q->nb[0] != sizeof(float)) return false;
++    if (q->ne[0] != DK) return false;
++
++    const int64_t n_head = q->ne[2], n_head_kv = k->ne[2];
++    if (v->ne[2] != n_head_kv || n_head % n_head_kv) return false;
++    const int G = (int) (n_head / n_head_kv);
++    if (G != 1 && G != 2 && G != 4 && G != 8) return false;
++
++    float scale, max_bias, softcap;
++    memcpy(&scale,    (float *) dst->op_params + 0, sizeof(float));
++    memcpy(&max_bias, (float *) dst->op_params + 1, sizeof(float));
++    memcpy(&softcap,  (float *) dst->op_params + 2, sizeof(float));
++    if (max_bias != 0.0f || softcap != 0.0f) return false;
++
++    static constexpr int64_t QS_MAX = 8192; // scaled-query scratch, n_head*DK floats
++    if (n_head*DK > QS_MAX) return false;
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++    const int64_t n_kv = k->ne[1];
++
++    // Work items are blocks of keys (covering every KV head, so each K/V row is read in one go),
++    // handed out through the threadpool counter so faster cores take more of them. Aim for
++    // ~4 items per thread, in multiples of the inner block.
++    int64_t wb = (n_kv + 4*nth - 1)/(4*nth);
++    wb = std::max<int64_t>(FA_DEC_BLOCK, (wb + FA_DEC_BLOCK - 1)/FA_DEC_BLOCK*FA_DEC_BLOCK);
++    const int64_t n_items = (n_kv + wb - 1)/wb;
++
++    // Each thread's running state lives in its partial slot, same layout as the split-KV path:
++    // [q_head][thread][M, S, VKQ[DV]]
++    const int64_t psize = 2 + DV;
++    float * partials = (float *) params->wdata + nth*(DK + 2*DV + CACHE_LINE_SIZE_F32);
++    for (int64_t h = 0; h < n_head; ++h) {
++        float * p = partials + (h*nth + ith)*psize;
++        p[0] = -INFINITY;
++        p[1] = 0.0f;
++        memset(p + 2, 0, DV*sizeof(float));
++    }
++
++    alignas(32) float qs[QS_MAX];
++    for (int64_t h = 0; h < n_head; ++h) {
++        const float * qr = (const float *) ((const char *) q->data + h*q->nb[2]);
++        for (int64_t d = 0; d < DK; ++d) qs[h*DK + d] = qr[d]*scale;
++    }
++
++    const ggml_fp16_t * mrow = mask ? (const ggml_fp16_t *) mask->data : nullptr;
++
++    if (ith == 0) {
++        ggml_threadpool_chunk_set(params->threadpool, nth);
++    }
++    ggml_barrier(params->threadpool);
++
++    float * st[8];
++    for (int64_t item = ith; item < n_items; item = ggml_threadpool_chunk_add(params->threadpool, 1)) {
++        const int64_t k0 = item*wb;
++        const int64_t k1 = std::min(k0 + wb, n_kv);
++        for (int64_t g = 0; g < n_head_kv; ++g) {
++            for (int h = 0; h < G; ++h) st[h] = partials + ((g*G + h)*nth + ith)*psize;
++            const float * qg = qs + g*G*DK;
++            const char * kb = (const char *) k->data + g*k->nb[2];
++            const char * vb = (const char *) v->data + g*v->nb[2];
++            switch (G) {
++                case 1: fa_dec_group<1>(qg, kb, k->nb[1], vb, v->nb[1], mrow, k0, k1, (int) DK, (int) DV, st); break;
++                case 2: fa_dec_group<2>(qg, kb, k->nb[1], vb, v->nb[1], mrow, k0, k1, (int) DK, (int) DV, st); break;
++                case 4: fa_dec_group<4>(qg, kb, k->nb[1], vb, v->nb[1], mrow, k0, k1, (int) DK, (int) DV, st); break;
++                case 8: fa_dec_group<8>(qg, kb, k->nb[1], vb, v->nb[1], mrow, k0, k1, (int) DK, (int) DV, st); break;
++            }
++        }
++    }
++
++    ggml_barrier(params->threadpool);
++    // chunk_size 0: no slot is skipped by position; slots with S == 0 (no keys) are skipped anyway
++    ggml_flash_attn_ext_reduce_partials(params, dst, nth, 0);
++    return true;
++}
++#endif // AVX2 && F16C && FMA
++
+ static void ggml_compute_forward_flash_attn_ext_f16(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+ 
++#if defined(__AVX2__) && defined(__F16C__) && defined(__FMA__)
++    if (ggml_compute_forward_flash_attn_ext_decode_fast(params, dst)) {
++        return;
++    }
++#endif
++
+     const ggml_tensor * q     = dst->src[0];
+     const ggml_tensor * k     = dst->src[1];
+     const ggml_tensor * v     = dst->src[2];

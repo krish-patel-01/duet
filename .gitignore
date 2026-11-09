@@ -1,0 +1,16 @@
+# llama.cpp source and prebuilt DLLs are downloaded, not committed
+third_party/
+bin/
+models/
+
+# build output
+build-*/
+dll-variants/
+traces/
+lib/*.lib
+lib/*.exp
+lib/*.obj
+*.exe
+*.dll
+*.gguf
+__pycache__/
